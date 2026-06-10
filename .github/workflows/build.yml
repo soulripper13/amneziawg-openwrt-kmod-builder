@@ -128,7 +128,13 @@ jobs:
           echo "ipk_name=${ipk_name}" >> "${GITHUB_OUTPUT}"
 
           mkdir -p control
-          (cd control && ar x "../artifacts/${ipk_name}")
+          file "artifacts/${ipk_name}"
+          if tar -tzf "artifacts/${ipk_name}" >/dev/null 2>&1; then
+            tar -xzf "artifacts/${ipk_name}" -C control
+          else
+            (cd control && ar x "../artifacts/${ipk_name}")
+          fi
+
           if [ -f control/control.tar.gz ]; then
             tar -xzf control/control.tar.gz -C control
           elif [ -f control/control.tar.zst ]; then
@@ -141,8 +147,15 @@ jobs:
 
           cat control/control
 
-          if ! grep -F "kernel (=${KERNEL_ABI}" control/control >/dev/null; then
+          kernel_version="${KERNEL_ABI%%-*}"
+          kernel_release_and_hash="${KERNEL_ABI#${kernel_version}-}"
+          kernel_release="${kernel_release_and_hash%%-*}"
+          kernel_hash="${kernel_release_and_hash#${kernel_release}-}"
+          expected_kernel_dep="kernel (=${kernel_version}~${kernel_hash}-r${kernel_release})"
+
+          if ! grep -F "${expected_kernel_dep}" control/control >/dev/null; then
             echo "Built package does not depend on expected kernel ABI: ${KERNEL_ABI}" >&2
+            echo "Expected dependency: ${expected_kernel_dep}" >&2
             exit 1
           fi
 
