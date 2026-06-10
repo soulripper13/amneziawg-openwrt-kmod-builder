@@ -1,0 +1,165 @@
+name: Build kmod-amneziawg
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_release:
+        description: OpenWrt/iStoreOS release
+        required: true
+        default: 24.10.7
+      target:
+        description: OpenWrt target path
+        required: true
+        default: x86/64
+      kernel_abi:
+        description: Expected kernel ABI from the kmods feed URL
+        required: true
+        default: 6.6.141-1-50daf8372d971124fb3519e8d87e02ae
+      amneziawg_ref:
+        description: amneziawg-linux-kernel-module git ref
+        required: true
+        default: master
+      publish_release:
+        description: Publish a GitHub release
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "20 3 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_RELEASE: ${{ inputs.openwrt_release || '24.10.7' }}
+  OPENWRT_TARGET: ${{ inputs.target || 'x86/64' }}
+  KERNEL_ABI: ${{ inputs.kernel_abi || '6.6.141-1-50daf8372d971124fb3519e8d87e02ae' }}
+  AMNEZIAWG_REPO: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git
+  AMNEZIAWG_REF: ${{ inputs.amneziawg_ref || 'master' }}
+  SDK_MIRROR: https://downloads.openwrt.org
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget curl zstd
+
+      - name: Download OpenWrt SDK
+        id: sdk
+        run: |
+          set -eu
+
+          sdk_base_url="${SDK_MIRROR}/releases/${OPENWRT_RELEASE}/targets/${OPENWRT_TARGET}"
+          echo "SDK base URL: ${sdk_base_url}"
+
+          sdk_file="$(
+            curl -fsSL "${sdk_base_url}/" |
+              grep -oE "openwrt-sdk-${OPENWRT_RELEASE//./\\.}-[^\"']+Linux-x86_64\\.tar\\.zst" |
+              head -n 1
+          )"
+
+          if [ -z "${sdk_file}" ]; then
+            echo "Could not find SDK tarball at ${sdk_base_url}" >&2
+            exit 1
+          fi
+
+          curl -fL "${sdk_base_url}/${sdk_file}" -o "${sdk_file}"
+          tar --use-compress-program=unzstd -xf "${sdk_file}"
+
+          sdk_dir="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
+          if [ -z "${sdk_dir}" ]; then
+            echo "SDK directory was not extracted" >&2
+            exit 1
+          fi
+
+          echo "sdk_dir=${sdk_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Add AmneziaWG package source
+        run: |
+          set -eu
+
+          sdk_dir="${{ steps.sdk.outputs.sdk_dir }}"
+          pkg_dir="${sdk_dir}/package/kmod-amneziawg"
+
+          mkdir -p "${pkg_dir}"
+          cp package/kmod-amneziawg/Makefile "${pkg_dir}/Makefile"
+
+          git clone --depth 1 --branch "${AMNEZIAWG_REF}" "${AMNEZIAWG_REPO}" "${pkg_dir}/src-repo"
+          mv "${pkg_dir}/src-repo/src" "${pkg_dir}/src"
+          cp "${pkg_dir}/src-repo/COPYING" "${pkg_dir}/src/COPYING"
+          rm -rf "${pkg_dir}/src-repo"
+
+      - name: Build kmod-amneziawg
+        run: |
+          set -eu
+          sdk_dir="${{ steps.sdk.outputs.sdk_dir }}"
+          cd "${sdk_dir}"
+
+          make defconfig
+          make package/kmod-amneziawg/clean V=s
+          make package/kmod-amneziawg/compile V=s
+
+      - name: Collect and verify package
+        id: package
+        run: |
+          set -eu
+          sdk_dir="${{ steps.sdk.outputs.sdk_dir }}"
+          mkdir -p artifacts
+
+          ipk="$(find "${sdk_dir}/bin" -type f -name 'kmod-amneziawg_*.ipk' | head -n 1)"
+          if [ -z "${ipk}" ]; then
+            echo "No kmod-amneziawg .ipk was produced" >&2
+            find "${sdk_dir}/bin" -type f | sort
+            exit 1
+          fi
+
+          cp "${ipk}" artifacts/
+          ipk_name="$(basename "${ipk}")"
+          echo "ipk_name=${ipk_name}" >> "${GITHUB_OUTPUT}"
+
+          mkdir -p control
+          (cd control && ar x "../artifacts/${ipk_name}")
+          if [ -f control/control.tar.gz ]; then
+            tar -xzf control/control.tar.gz -C control
+          elif [ -f control/control.tar.zst ]; then
+            tar --use-compress-program=unzstd -xf control/control.tar.zst -C control
+          else
+            echo "Unsupported ipk control archive" >&2
+            ls -la control
+            exit 1
+          fi
+
+          cat control/control
+
+          if ! grep -F "kernel (=${KERNEL_ABI}" control/control >/dev/null; then
+            echo "Built package does not depend on expected kernel ABI: ${KERNEL_ABI}" >&2
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmod-amneziawg-${{ env.OPENWRT_RELEASE }}-${{ env.KERNEL_ABI }}
+          path: artifacts/*.ipk
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.publish_release == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="kmod-amneziawg-${OPENWRT_RELEASE}-${KERNEL_ABI}"
+          gh release create "${tag}" artifacts/*.ipk \
+            --title "${tag}" \
+            --notes "kmod-amneziawg for OpenWrt/iStoreOS ${OPENWRT_RELEASE}, target ${OPENWRT_TARGET}, kernel ABI ${KERNEL_ABI}"

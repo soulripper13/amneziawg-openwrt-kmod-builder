@@ -1,0 +1,6 @@
+.DS_Store
+.env
+sdk/
+build/
+*.ipk
+*.tar.zst
